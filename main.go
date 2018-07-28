@@ -1,13 +1,15 @@
 package main
 
 import (
-	"path/filepath"
-	"os"
-	"hash"
 	"crypto/sha256"
-	"fmt"
 	"encoding/hex"
+	"fmt"
+	"hash"
 	"io"
+	"os"
+	"path/filepath"
+	"runtime"
+	"sync"
 )
 
 const ReadBlockSize = 1024 * 16
@@ -18,7 +20,7 @@ func main() {
 	files := []FileWithHasher{}
 
 	filepath.Walk(".", func(path string, info os.FileInfo, err error) error {
-		if !info.IsDir() {
+		if !info.IsDir() && info.Size() > 0 {
 			files = append(files, FileWithHasher{
 				hasher:   sha256.New(),
 				path:     path,
@@ -30,46 +32,71 @@ func main() {
 		return nil
 	})
 
-	//fmt.Println(len(files))
-	//for i := 0; i < len(files); i++ {
-	//	fmt.Println(files[i])
-	//}
-
 	// fill initial cache
 	file_cache := make(map[SizeDigestPair][]*FileWithHasher)
 	for i := 0; i < len(files); i++ {
 		fh := &files[i]
-		if key, active := fh.iterate(); active {
-			file_cache[key] = append(file_cache[key], fh)
+		// initially the has is all zeros and that's ok. This way we first differentiate by size of files only, not
+		// their contents
+		key := SizeDigestPair{
+			filesize: fh.filesize,
 		}
+		file_cache[key] = append(file_cache[key], fh)
 	}
 
-	final_file_buckets := make(map[SizeDigestPair][]*FileWithHasher)
+	jobs := make(chan []*FileWithHasher, len(files))
+	results := make(chan []*FileWithHasher, len(files))
 
-	for len(file_cache) > 0 {
-		new_file_cache := make(map[SizeDigestPair][]*FileWithHasher)
-		for old_key, arr := range file_cache {
-			if len(arr) == 1 {
-				// file is unique
-				continue
-			} else {
-				for _, fh := range arr {
-					if key, active := fh.iterate(); active {
-						new_file_cache[key] = append(new_file_cache[key], fh)
-					} else {
-						final_file_buckets[old_key] = append(final_file_buckets[old_key], fh)
-					}
-				}
+	wg := &sync.WaitGroup{}
+
+	for i := 0; i <= runtime.GOMAXPROCS(-1); i++ {
+		go worker(wg, jobs, results)
+	}
+
+	wg.Add(len(file_cache))
+	for _, v := range file_cache {
+		jobs <- v
+	}
+
+	go func() {
+		for arr := range results {
+			key := arr[0].get_key()
+			for _, fh := range arr {
+				fmt.Println(hex.EncodeToString(key.digest[:4]), fh.path)
 			}
 		}
-		file_cache = new_file_cache
-		//fmt.Println(len(file_cache))
-	}
+	}()
 
-	for key, arr := range final_file_buckets {
-		for _, fh := range arr {
-			fmt.Println(hex.EncodeToString(key.digest[:8]), fh.path)
+	wg.Wait()
+}
+
+func worker(wg *sync.WaitGroup, buckets chan []*FileWithHasher, results chan<- []*FileWithHasher) {
+	for bucket := range buckets {
+
+		new_file_buckets := make(map[SizeDigestPair][]*FileWithHasher)
+		final_file_buckets := make(map[SizeDigestPair][]*FileWithHasher)
+
+		for _, fh := range bucket {
+			if key, active := fh.iterate(); active {
+				new_file_buckets[key] = append(new_file_buckets[key], fh)
+			} else {
+				final_file_buckets[fh.get_key()] = append(final_file_buckets[fh.get_key()], fh)
+			}
 		}
+
+		for _, v := range new_file_buckets {
+			if len(v) > 1 {
+				buckets <- v
+				wg.Add(1)
+			}
+		}
+		for _, v := range final_file_buckets {
+			if len(v) > 1 {
+				results <- v
+			}
+		}
+
+		wg.Done()
 	}
 }
 
@@ -84,15 +111,14 @@ type FileWithHasher struct {
 	path     string
 	hasher   hash.Hash
 	offset   int64
+	digest   [sha256.Size]byte
 }
 
 func (fh *FileWithHasher) get_key() SizeDigestPair {
-	digestSlice := fh.hasher.Sum(nil)
-	pair := SizeDigestPair{
+	return SizeDigestPair{
 		filesize: fh.filesize,
+		digest:   fh.digest,
 	}
-	copy(pair.digest[0:sha256.Size], digestSlice[0:sha256.Size])
-	return pair
 }
 
 func (fh *FileWithHasher) iterate() (SizeDigestPair, bool) {
@@ -108,6 +134,8 @@ func (fh *FileWithHasher) iterate() (SizeDigestPair, bool) {
 	} else {
 		die(err)
 		fh.hasher.Write(buf)
+		digestSlice := fh.hasher.Sum(nil)
+		copy(fh.digest[0:sha256.Size], digestSlice[0:sha256.Size])
 		return fh.get_key(), true
 	}
 }
